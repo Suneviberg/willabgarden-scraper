@@ -92,9 +92,12 @@ class Product:
     product_type: Optional[str]
     google_product_category: Optional[str]
     variants: list = field(default_factory=list)
+    # Populated only by page enrichment (scraper.py --enrich); see enrich.py.
+    specifications: Optional[dict] = None
+    full_description: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "group_id": self.group_id,
             "title": self.title,
             "description": self.description,
@@ -102,11 +105,50 @@ class Product:
             "product_type": self.product_type,
             "google_product_category": self.google_product_category,
             "variant_count": len(self.variants),
-            "variants": [v.to_dict() for v in self.variants],
         }
+        # Only surface enrichment fields when present, so un-enriched output
+        # keeps its original shape.
+        if self.specifications is not None:
+            data["specifications"] = self.specifications
+        if self.full_description is not None:
+            data["full_description"] = self.full_description
+        data["variants"] = [v.to_dict() for v in self.variants]
+        return data
 
 
 # --- Fetching -----------------------------------------------------------------
+def http_get(
+    url: str,
+    session: Optional[requests.Session] = None,
+    timeout: int = 60,
+    retries: int = 3,
+) -> bytes:
+    """GET ``url`` with a descriptive User-Agent and retry-with-backoff.
+
+    Shared by the feed fetch and the page enrichment so both use the same polite
+    network behaviour. Returns the response body as bytes.
+    """
+    get = (session or requests).get
+    headers = {"User-Agent": USER_AGENT}
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content
+        except requests.RequestException as err:  # network / HTTP error
+            last_err = err
+            if attempt == retries:
+                raise
+            backoff = 2 ** (attempt - 1)
+            print(
+                f"  fetch attempt {attempt} failed ({err}); retrying in {backoff}s",
+                file=sys.stderr,
+            )
+            time.sleep(backoff)
+    raise last_err  # pragma: no cover - loop always returns or raises
+
+
 def fetch_feed(
     url: str,
     cache_path: Optional[str] = None,
@@ -128,26 +170,7 @@ def fetch_feed(
         except FileNotFoundError:
             pass  # fall through to network fetch, then populate the cache
 
-    headers = {"User-Agent": USER_AGENT}
-    last_err: Optional[Exception] = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.content
-            break
-        except requests.RequestException as err:  # network / HTTP error
-            last_err = err
-            if attempt == retries:
-                raise
-            backoff = 2 ** (attempt - 1)
-            print(
-                f"  fetch attempt {attempt} failed ({err}); retrying in {backoff}s",
-                file=sys.stderr,
-            )
-            time.sleep(backoff)
-    else:  # pragma: no cover - loop always breaks or raises
-        raise last_err  # type: ignore[misc]
+    data = http_get(url, timeout=timeout, retries=retries)
 
     if cache_path:
         with open(cache_path, "wb") as fh:
@@ -462,6 +485,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Save the fetched feed here; reuse it on later runs if it exists.",
     )
+    p.add_argument(
+        "--enrich",
+        action="store_true",
+        help=(
+            "Enrich each product from its page (colour, material, dimensions, "
+            "full spec table, rich description). One request per product; slower "
+            "but produces a richer JSON. See enrich.py."
+        ),
+    )
+    p.add_argument(
+        "--enrich-delay",
+        type=float,
+        default=0.3,
+        metavar="SECONDS",
+        help="Delay between enrichment page requests, to stay polite.",
+    )
     pretty = p.add_mutually_exclusive_group()
     pretty.add_argument(
         "--pretty",
@@ -513,6 +552,18 @@ def main(argv: Optional[list] = None) -> int:
         f"Parsed {entry_count} items → {len(products)} products"
         f" ({grouped} variants grouped){limit_note}"
     )
+
+    if args.enrich:
+        # Imported lazily so the core scraper has no import-time coupling to the
+        # enrichment path (and a failed enrich import can't break a plain run).
+        from enrich import enrich_products
+
+        print(f"Enriching {len(products)} products from their pages…")
+        stats = enrich_products(products, delay=args.enrich_delay)
+        print(
+            f"Enriched {stats['enriched']}/{stats['attempted']} products"
+            f" ({stats['failed']} failed)"
+        )
 
     document = build_document(products, args.feed_url)
     write_json(document, args.output, pretty=args.pretty)
