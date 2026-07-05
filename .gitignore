@@ -17,8 +17,9 @@ willabgarden_products.json
 # Internal build brief (private interview instructions — not for publication)
 willabgarden-scraper-brief.md
 
-# OS / editor
+# OS / editor / tooling
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+.claude/
