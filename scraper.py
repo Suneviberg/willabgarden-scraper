@@ -63,9 +63,12 @@ class Variant:
     mpn: Optional[str]
     image_link: Optional[str]
     additional_image_links: list = field(default_factory=list)
+    # Full spec table from the variant's own page; set only by --enrich. It is
+    # variant-specific (colour, dimensions differ between a product's variants).
+    specifications: Optional[dict] = None
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "id": self.id,
             "title": self.title,
             "link": self.link,
@@ -81,6 +84,11 @@ class Variant:
             "image_link": self.image_link,
             "additional_image_links": self.additional_image_links,
         }
+        # Only surface enrichment fields when present, so un-enriched output
+        # keeps its original shape.
+        if self.specifications is not None:
+            data["specifications"] = self.specifications
+        return data
 
 
 @dataclass
@@ -92,8 +100,8 @@ class Product:
     product_type: Optional[str]
     google_product_category: Optional[str]
     variants: list = field(default_factory=list)
-    # Populated only by page enrichment (scraper.py --enrich); see enrich.py.
-    specifications: Optional[dict] = None
+    # Product-level rich description from the page; set only by --enrich. Unlike
+    # the per-variant spec table, the description is shared across variants.
     full_description: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -106,10 +114,8 @@ class Product:
             "google_product_category": self.google_product_category,
             "variant_count": len(self.variants),
         }
-        # Only surface enrichment fields when present, so un-enriched output
+        # Only surface the enrichment field when present, so un-enriched output
         # keeps its original shape.
-        if self.specifications is not None:
-            data["specifications"] = self.specifications
         if self.full_description is not None:
             data["full_description"] = self.full_description
         data["variants"] = [v.to_dict() for v in self.variants]
@@ -489,17 +495,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--enrich",
         action="store_true",
         help=(
-            "Enrich each product from its page (colour, material, dimensions, "
-            "full spec table, rich description). One request per product; slower "
-            "but produces a richer JSON. See enrich.py."
+            "Enrich each variant from its own page (colour, material, "
+            "dimensions, full spec table, rich description). One request per "
+            "variant; slower but produces a much richer JSON. See enrich.py."
         ),
+    )
+    p.add_argument(
+        "--enrich-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Concurrent workers for enrichment page fetches.",
     )
     p.add_argument(
         "--enrich-delay",
         type=float,
-        default=0.3,
+        default=0.1,
         metavar="SECONDS",
-        help="Delay between enrichment page requests, to stay polite.",
+        help="Minimum delay between enrichment requests, to stay polite.",
+    )
+    p.add_argument(
+        "--enrich-cache",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory to cache fetched product pages; reused on later runs so "
+            "re-enriching is near-instant and doesn't re-hit the server."
+        ),
     )
     pretty = p.add_mutually_exclusive_group()
     pretty.add_argument(
@@ -558,11 +580,20 @@ def main(argv: Optional[list] = None) -> int:
         # enrichment path (and a failed enrich import can't break a plain run).
         from enrich import enrich_products
 
-        print(f"Enriching {len(products)} products from their pages…")
-        stats = enrich_products(products, delay=args.enrich_delay)
+        total_variants = sum(len(p.variants) for p in products)
         print(
-            f"Enriched {stats['enriched']}/{stats['attempted']} products"
-            f" ({stats['failed']} failed)"
+            f"Enriching {total_variants} variants from their pages "
+            f"({args.enrich_workers} workers)…"
+        )
+        stats = enrich_products(
+            products,
+            workers=args.enrich_workers,
+            delay=args.enrich_delay,
+            cache_dir=args.enrich_cache,
+        )
+        print(
+            f"Enriched {stats['enriched']}/{stats['variants']} variants"
+            f" ({stats['failed']} failed, {stats['from_cache']} from cache)"
         )
 
     document = build_document(products, args.feed_url)

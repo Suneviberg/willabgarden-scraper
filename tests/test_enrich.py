@@ -72,52 +72,64 @@ def test_enrich_wg40_extracts_colour_and_full_spec_table():
     assert specs["Typ av glas"] == "4 mm säkerhetsenergiglas"
 
 
-# --- Merge semantics ----------------------------------------------------------
-def _make_product(**variant_kwargs):
+# --- Merge semantics (per variant) -------------------------------------------
+def _make_variant(**kwargs):
     base = dict(
         id="X1", title="T", link="https://x", price=None, sale_price=None,
         availability=None, condition=None, color=None, size=None, material=None,
         gtin=None, mpn=None, image_link=None, additional_image_links=[],
     )
-    base.update(variant_kwargs)
+    base.update(kwargs)
+    return Variant(**base)
+
+
+def _make_product(variants):
     return Product(
         group_id="g", title="T", description=None, brand=None,
-        product_type=None, google_product_category=None, variants=[Variant(**base)],
+        product_type=None, google_product_category=None, variants=variants,
     )
 
 
-def test_apply_enrichment_fills_gaps_only():
-    # Enrichment fills a null colour but must NOT overwrite a colour already set.
-    product = _make_product(color=None)
-    enrich.apply_enrichment(product, {"color": "Khaki", "material": None,
-                                      "size": None, "specifications": {"a": "b"},
-                                      "full_description": "desc"})
-    assert product.variants[0].color == "Khaki"
-    assert product.specifications == {"a": "b"}
-    assert product.full_description == "desc"
+def test_apply_variant_enrichment_fills_gaps_only():
+    v = _make_variant(color=None)
+    enrich.apply_variant_enrichment(v, {"color": "Khaki", "material": None,
+                                        "size": None, "specifications": {"a": "b"}})
+    assert v.color == "Khaki"
+    assert v.specifications == {"a": "b"}
 
 
-def test_apply_enrichment_does_not_overwrite_existing_variant_data():
-    product = _make_product(color="Feed Colour")
-    enrich.apply_enrichment(product, {"color": "Page Colour", "material": None,
-                                      "size": None, "specifications": None,
-                                      "full_description": None})
-    assert product.variants[0].color == "Feed Colour"
+def test_apply_variant_enrichment_does_not_overwrite_feed_data():
+    v = _make_variant(color="Feed Colour")
+    enrich.apply_variant_enrichment(v, {"color": "Page Colour", "material": None,
+                                        "size": None, "specifications": None})
+    assert v.color == "Feed Colour"
 
 
-def test_enriched_product_to_dict_includes_new_fields():
-    product = _make_product()
-    enrich.apply_enrichment(product, {"color": "Khaki", "material": None,
-                                      "size": None, "specifications": {"Färg": "Khaki"},
-                                      "full_description": "desc"})
-    d = product.to_dict()
+def test_variants_get_their_own_colour():
+    # The core correctness property: two variants of one product enriched from
+    # their own pages must keep DISTINCT colours (not share the first one).
+    v1 = _make_variant(id="A")
+    v2 = _make_variant(id="B")
+    enrich.apply_variant_enrichment(v1, {"color": "RAL 9010 - Vit", "material": None,
+                                         "size": None, "specifications": None})
+    enrich.apply_variant_enrichment(v2, {"color": "RAL 9008 - Metallicgrå",
+                                         "material": None, "size": None,
+                                         "specifications": None})
+    assert v1.color == "RAL 9010 - Vit"
+    assert v2.color == "RAL 9008 - Metallicgrå"
+
+
+def test_enriched_variant_to_dict_includes_specifications():
+    v = _make_variant()
+    enrich.apply_variant_enrichment(v, {"color": "Khaki", "material": None,
+                                        "size": None,
+                                        "specifications": {"Färg": "Khaki"}})
+    d = v.to_dict()
     assert d["specifications"] == {"Färg": "Khaki"}
-    assert d["full_description"] == "desc"
 
 
-def test_unenriched_product_to_dict_omits_new_fields():
-    # A product that was never enriched keeps its original shape.
-    product = _make_product()
-    d = product.to_dict()
-    assert "specifications" not in d
-    assert "full_description" not in d
+def test_unenriched_output_omits_new_fields():
+    v = _make_variant()
+    product = _make_product([v])
+    assert "specifications" not in v.to_dict()
+    assert "full_description" not in product.to_dict()

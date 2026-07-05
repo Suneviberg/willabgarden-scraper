@@ -111,8 +111,10 @@ Wrote willabgarden_products.json
 | `--output PATH` | `willabgarden_products.json` | Output JSON path. |
 | `--limit N` | *(all)* | Process only the first N **products** (post-grouping). Great for a fast smoke test. |
 | `--raw-cache PATH` | *(off)* | Save the fetched feed to this path; if it already exists, parse it instead of re-fetching. Faster iteration, polite to the server. |
-| `--enrich` | *(off)* | Visit each product page to add colour, material, dimensions, the full spec table, and a rich description. See [below](#optional-enrichment---enrich). |
-| `--enrich-delay SECONDS` | `0.3` | Delay between enrichment page requests, to stay polite. |
+| `--enrich` | *(off)* | Visit each **variant's** page to add colour, material, dimensions, the full spec table, and a rich description. See [below](#optional-enrichment---enrich). |
+| `--enrich-workers N` | `8` | Concurrent workers for enrichment page fetches. |
+| `--enrich-delay SECONDS` | `0.1` | Minimum delay between enrichment requests, to stay polite. |
+| `--enrich-cache DIR` | *(off)* | Cache fetched product pages here; reused on later runs so re-enriching is near-instant. |
 | `--pretty` / `--no-pretty` | pretty | Pretty-print (default) or emit compact JSON. |
 
 ---
@@ -125,43 +127,66 @@ not in the server-rendered HTML (the page is client-side rendered and ships an
 empty `<main>`), but it *is* embedded in a JSON hydration blob under
 `pageContent.product` in each page. [`enrich.py`](enrich.py) extracts that blob
 **without a headless browser** — a plain `requests` GET plus JSON parsing — and
-merges the result onto the feed's products.
+merges the result onto the feed's variants.
 
 ```bash
-python scraper.py --enrich                    # full catalogue, enriched
-python scraper.py --limit 20 --enrich         # quick enriched sample
+# Full catalogue, enriched, with a page cache so re-runs are near-instant:
+python scraper.py --enrich --enrich-cache .page_cache
+
+# Quick enriched sample:
+python scraper.py --limit 5 --enrich --enrich-cache .page_cache
 ```
 
 What it adds:
 
 - Fills `color` / `material` / `size` on variants where the feed left them
-  `null` (from the product's "Produktspecifikation" table).
-- Adds a product-level **`specifications`** object — the full spec table as
-  key/value pairs (e.g. `Material väggar`, `Stormgaranti`, `Typ av glas`).
+  `null` (from the variant's "Produktspecifikation" table).
+- Adds a per-variant **`specifications`** object — the full spec table as
+  key/value pairs (e.g. `Färg`, `Material väggar`, `Stormgaranti`, `Typ av glas`).
 - Adds a product-level **`full_description`** — the page's rich description text.
 
-Measured on a 51-product sample spanning all six categories (1,275 variants):
+### Why enrichment is per **variant**, not per product
+
+This is the key correctness point. Colour, dimensions and the spec table **differ
+between the variants of one product** — a greenhouse comes as a matrix of sizes ×
+colours, and *each combination is its own SKU with its own page*. A single page
+only describes its own SKU; it can't tell you a sibling's colour. So enrichment
+fetches **each variant's own page** and applies that page's attributes to *that
+variant only*.
+
+(An earlier version fetched one page per product group and copied its colour onto
+every variant — which was wrong for every multi-colour product. Fetching per
+variant is the fix; see the report for the full story.)
+
+Because that is up to ~13.6k page fetches on the full catalogue, enrichment is:
+
+- **concurrent** — a bounded thread pool (`--enrich-workers`, default 8),
+- **cached** — pages are stored on disk (`--enrich-cache DIR`), so re-runs are
+  near-instant and don't re-hit the server,
+- **polite** — a minimum delay between requests (`--enrich-delay`), and
+- **opt-in** — only runs with `--enrich`.
+
+Measured on a 413-variant sample spanning all six categories, with each variant
+enriched from its own page:
 
 | Attribute | Feed only | With `--enrich` |
 | --- | --- | --- |
-| `color` | ~0% | **70%** |
-| `size` | 20% | **55%** |
-| `material` | 4% | **52%** |
-| `specifications` | — | **100%** of products |
+| `color` | ~0% | **68%** |
+| `size` | 20% | **38%** |
+| `material` | 4% | **31%** |
+| `specifications` | — | **100%** of variants |
 | `full_description` | — | **100%** of products |
 
-Design notes:
+Other design notes:
 
 - **Feed data wins.** Enrichment only fills `null`s and adds new fields; it never
   overwrites a value already present from the feed.
-- **Product-level, not per-variant** — one request per product (~792 total, a few
-  minutes with the default polite delay), because the spec table is
-  product-level. It is opt-in so the core scraper stays fast and dependency-light.
 - **Best-effort and safe** — the `pageContent.product` shape is an internal CMS
   structure that could change. A page that can't be fetched or parsed simply
-  leaves the feed data untouched; enrichment never aborts the run.
-- **Output shape is stable** — the `specifications` / `full_description` keys only
-  appear when enrichment runs, so plain (un-enriched) output is unchanged.
+  leaves that variant's feed data untouched; enrichment never aborts the run.
+- **Output shape is stable** — the per-variant `specifications` and product-level
+  `full_description` keys only appear when enrichment runs, so plain (un-enriched)
+  output is unchanged.
 
 ---
 
@@ -172,9 +197,10 @@ preserved (`ensure_ascii=False`), prices are structured into an amount and
 currency, and every product carries a uniform `variants` array — even
 standalone products (a single-element array), so consumers never special-case.
 
-The example below is from an **enriched** run; the `specifications` and
-`full_description` keys (and most `color`/`material`/`size` values) come from
-enrichment and are absent in a plain run.
+The example below is from an **enriched** run. `full_description` is
+product-level; the per-variant `specifications` and most `color`/`material`/`size`
+values come from enrichment and are absent in a plain run. Note the two variants
+carry **different colours** — each was enriched from its own page.
 
 ```json
 {
@@ -191,12 +217,6 @@ enrichment and are absent in a plain run.
       "product_type": "Växthus > Växthusmodeller > Stormsäkra växthus",
       "google_product_category": null,
       "variant_count": 73,
-      "specifications": {
-        "Yta": "24,4 m²",
-        "Färg": "RAL 3005 - Vinröd",
-        "Material väggar": "4 mm säkerhetsglas",
-        "Stormgaranti": "5 år"
-      },
       "full_description": "Green Room är Willab Gardens serie för stormsäkra växthus…",
       "variants": [
         {
@@ -213,7 +233,20 @@ enrichment and are absent in a plain run.
           "gtin": null,
           "mpn": null,
           "image_link": "https://…",
-          "additional_image_links": ["https://…", "https://…"]
+          "additional_image_links": ["https://…"],
+          "specifications": {
+            "Yta": "24,4 m²",
+            "Färg": "RAL 3005 - Vinröd",
+            "Material väggar": "4 mm säkerhetsglas",
+            "Stormgaranti": "5 år"
+          }
+        },
+        {
+          "id": "3024SW",
+          "title": "Green Room Classic växthus 24.4 m²",
+          "color": "RAL 9010 - Vit",
+          "size": "24.4 m²",
+          "specifications": { "Färg": "RAL 9010 - Vit", "…": "…" }
         }
       ]
     }
@@ -221,9 +254,9 @@ enrichment and are absent in a plain run.
 }
 ```
 
-A committed [`sample_output.json`](sample_output.json) (generated with
-`--limit 10 --enrich`) lets you see the exact shape — including the enrichment
-fields — without running anything.
+A committed [`sample_output.json`](sample_output.json) — a small, enriched,
+multi-category sample — lets you see the exact shape (including the per-variant
+colours) without running anything.
 
 ### How variants are grouped
 
@@ -306,11 +339,11 @@ The suite runs fully offline. It covers:
 
 ## Possible extensions
 
-- **Concurrency for enrichment.** Enrichment is currently sequential (polite by
-  default). A bounded thread pool would cut the full-catalogue enrich time
-  substantially while still rate-limiting.
-- **Page cache for enrichment.** Like `--raw-cache` for the feed, caching fetched
-  product pages would make repeated enriched runs instant and even more polite.
+- **Normalise enriched values.** The spec-table values are kept verbatim (e.g.
+  colour as `"RAL 3005 - Vinröd"`, size sometimes as a compound dimension
+  string). A normalisation pass could split these into structured sub-fields.
+- **Incremental enrichment.** Combined with the page cache, only re-fetch
+  variants whose feed entry changed since the last run.
 - **Hello Retail API.** The site also loads Hello Retail (`helloretailcdn.com`,
   `websiteUuid` present in the page). Its search API could provide an alternative
   structured source or power availability/recommendation data.

@@ -14,8 +14,14 @@ __pycache__/
 raw_feed.xml
 willabgarden_products.json
 
-# Internal build brief (private interview instructions — not for publication)
+# Enrichment page cache (regenerated on demand) and scratch/verification files.
+.page_cache/
+_verify.json
+_*.json
+
+# Internal build brief and personal interview-prep report (not for publication)
 willabgarden-scraper-brief.md
+ENGINEERING_REPORT.md
 
 # OS / editor / tooling
 .DS_Store

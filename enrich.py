@@ -7,35 +7,49 @@ table. That information *is* available on each product page — not in the
 server-rendered HTML (the page is client-side rendered and ships an empty
 ``<main>``), but embedded in a JSON hydration blob under ``pageContent.product``.
 
-This module extracts that blob **without a headless browser** and turns it into
-extra fields that are merged onto the feed's variants:
+This module extracts that blob **without a headless browser** and merges it onto
+the feed's variants:
 
-- ``color`` / ``material`` / ``size`` — filled from the product's
-  "Produktspecifikation" table when the feed left them ``null``.
-- ``specifications`` — the full spec table as a key/value dict.
-- ``full_description`` — the page's rich description text.
+- ``color`` / ``material`` / ``size`` and a full ``specifications`` table are
+  filled **per variant**, from each variant's own page.
+- ``full_description`` is added at the **product level** (it is shared across a
+  product's variants).
 
-Enrichment happens at the **product level** (one request per product, keyed by
-``item_group_id``) rather than per variant, because the spec table is
-product-level. It is opt-in via ``scraper.py --enrich`` so the core scraper
-stays fast and dependency-light.
+**Enrichment is per variant, not per product.** Colour, dimensions and the spec
+table differ *between* the variants of one product (a greenhouse comes in a
+matrix of sizes × colours, each its own SKU and page), so a single page cannot
+describe its siblings — each variant's attributes live only on its own page.
+Fetching one page per group and copying its colour onto every variant would be
+wrong; we fetch every variant's own page instead.
+
+Because that is up to ~13.6k requests on the full catalogue, enrichment is:
+
+- **concurrent** — a bounded thread pool (``--enrich-workers``),
+- **cached** — fetched pages are stored on disk (``--enrich-cache``) so re-runs
+  are near-instant and repeat runs don't re-hit the server,
+- **polite** — a small per-request delay, and
+- **opt-in** — only runs with ``scraper.py --enrich``.
 
 The ``pageContent.product`` shape is an internal CMS structure and could change;
 enrichment is therefore best-effort and never fails the run — a page that can't
-be parsed simply leaves the feed data untouched.
+be fetched or parsed simply leaves that variant's feed data untouched.
 """
 
 from __future__ import annotations
 
+import hashlib
 import html as html_module
 import json
+import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import requests
 
-from scraper import USER_AGENT, http_get
+from scraper import http_get
 
 
 # --- Extracting the hydration blob -------------------------------------------
@@ -144,7 +158,10 @@ def _first_key_prefix(specs: dict, prefixes: tuple) -> Optional[str]:
 
 
 def build_enrichment(product: dict) -> dict:
-    """Extract the useful extra fields from a ``pageContent.product`` object."""
+    """Extract the useful extra fields from one ``pageContent.product`` object.
+
+    This describes a *single variant* — the SKU whose page was fetched.
+    """
     details = product.get("additionalDetails") or []
     specs: dict = {}
     for section in details:
@@ -176,64 +193,135 @@ def enrich_from_html(html: str) -> Optional[dict]:
     return build_enrichment(product)
 
 
-# --- Applying enrichment to feed products ------------------------------------
-def apply_enrichment(product, enrichment: dict) -> None:
-    """Merge an enrichment dict onto a feed ``Product`` in place.
+# --- Applying enrichment to a single variant ---------------------------------
+def apply_variant_enrichment(variant, enrichment: dict) -> None:
+    """Merge one variant's page enrichment onto that ``Variant`` in place.
 
-    Feed data wins where it exists; enrichment only *fills gaps* for
-    color/material/size, and adds the new ``specifications`` /
-    ``full_description`` fields at the product level. The enrichment reflects the
-    product's default variant, so the attribute fills are applied to variants
-    that are still missing them.
+    Feed data wins where it exists: ``color`` / ``material`` / ``size`` are only
+    filled when the feed left them ``None``. The full ``specifications`` table
+    (which is variant-specific) is attached to the variant.
     """
-    product.specifications = enrichment.get("specifications")
-    product.full_description = enrichment.get("full_description")
-    for variant in product.variants:
-        for field_name in ("color", "material", "size"):
-            if getattr(variant, field_name) is None and enrichment.get(field_name):
-                setattr(variant, field_name, enrichment[field_name])
+    for field_name in ("color", "material", "size"):
+        if getattr(variant, field_name) is None and enrichment.get(field_name):
+            setattr(variant, field_name, enrichment[field_name])
+    if enrichment.get("specifications"):
+        variant.specifications = enrichment["specifications"]
 
 
+# --- Disk page cache ----------------------------------------------------------
+class PageCache:
+    """Tiny disk cache mapping a URL to its fetched HTML.
+
+    Keyed by a hash of the URL so re-runs (and repeated runs) never re-hit the
+    server for a page already seen. A ``None`` directory disables caching.
+    """
+
+    def __init__(self, directory: Optional[str]):
+        self.directory = directory
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+    def _path(self, url: str) -> Optional[str]:
+        if not self.directory:
+            return None
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+        return os.path.join(self.directory, f"{digest}.html")
+
+    def get(self, url: str) -> Optional[str]:
+        path = self._path(url)
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read()
+        return None
+
+    def put(self, url: str, html: str) -> None:
+        path = self._path(url)
+        if path:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+
+
+# --- Orchestration ------------------------------------------------------------
 def enrich_products(
     products,
-    session: Optional[requests.Session] = None,
-    delay: float = 0.3,
+    workers: int = 8,
+    delay: float = 0.1,
+    cache_dir: Optional[str] = None,
     limit: Optional[int] = None,
     progress: bool = True,
 ) -> dict:
-    """Enrich a list of feed ``Product`` objects by fetching each product page.
+    """Enrich feed ``Product`` objects by fetching **each variant's own page**.
 
-    One request per product (using the first variant's ``link``), throttled by
-    ``delay`` seconds to stay polite. Returns a small stats dict. Never raises on
-    a single-page failure — enrichment is best-effort.
+    Colour, dimensions and the spec table differ between a product's variants, so
+    every variant is enriched from its own page. Requests run on a bounded thread
+    pool (``workers``), each throttled by ``delay`` seconds, and pages are served
+    from ``cache_dir`` when present. The product-level ``full_description`` is set
+    from the first variant that yields one (it is shared across variants).
+
+    Returns a stats dict. A single page failing never aborts the run.
     """
-    session = session or requests.Session()
-    targets = products[:limit] if limit is not None else products
-    stats = {"attempted": 0, "enriched": 0, "failed": 0, "skipped_no_link": 0}
+    cache = PageCache(cache_dir)
+    session = requests.Session()
+    throttle = threading.Lock()
 
-    for i, product in enumerate(targets, 1):
-        link = product.variants[0].link if product.variants else None
-        if not link:
-            stats["skipped_no_link"] += 1
-            continue
-        stats["attempted"] += 1
+    targets = products[:limit] if limit is not None else products
+    # Flatten to (product, variant) tasks — one page fetch per variant.
+    tasks = [
+        (product, variant)
+        for product in targets
+        for variant in product.variants
+        if variant.link
+    ]
+    total = len(tasks)
+    stats = {"variants": total, "enriched": 0, "failed": 0, "from_cache": 0}
+    done = 0
+    stats_lock = threading.Lock()
+
+    def fetch_html(url: str) -> str:
+        cached = cache.get(url)
+        if cached is not None:
+            with stats_lock:
+                stats["from_cache"] += 1
+            return cached
+        # Politeness: serialise the *rate* (short sleep) without serialising the
+        # whole request, so workers still overlap network latency.
+        if delay:
+            with throttle:
+                time.sleep(delay)
+        html = http_get(url, session=session).decode("utf-8", errors="replace")
+        cache.put(url, html)
+        return html
+
+    def work(task):
+        product, variant = task
         try:
-            html = http_get(link, session=session).decode("utf-8", errors="replace")
+            html = fetch_html(variant.link)
             enrichment = enrich_from_html(html)
             if enrichment is None:
-                stats["failed"] += 1
-            else:
-                apply_enrichment(product, enrichment)
-                stats["enriched"] += 1
-        except Exception:  # network/parse issue on one page must not abort the run
-            stats["failed"] += 1
+                return product, None
+            apply_variant_enrichment(variant, enrichment)
+            return product, enrichment
+        except Exception:  # one page's failure must not abort the run
+            return product, "error"
 
-        if progress and (i % 25 == 0 or i == len(targets)):
-            print(
-                f"  enriched {i}/{len(targets)} products "
-                f"({stats['enriched']} ok, {stats['failed']} failed)"
-            )
-        if delay:
-            time.sleep(delay)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for product, result in pool.map(work, tasks):
+            with stats_lock:
+                done += 1
+                if result == "error" or result is None:
+                    stats["failed"] += 1
+                else:
+                    stats["enriched"] += 1
+                    # full_description is shared; set it once per product.
+                    if product.full_description is None and result.get(
+                        "full_description"
+                    ):
+                        product.full_description = result["full_description"]
+                if progress and (done % 250 == 0 or done == total):
+                    print(
+                        f"  enriched {done}/{total} variants "
+                        f"({stats['enriched']} ok, {stats['failed']} failed, "
+                        f"{stats['from_cache']} cached)"
+                    )
 
     return stats
