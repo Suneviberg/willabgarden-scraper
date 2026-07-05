@@ -1,15 +1,22 @@
 # Willab Garden product scraper
 
-A small, single-file Python scraper that collects the **entire Willab Garden
-catalogue** from the retailer's public Google Merchant product feed, groups
-product variants correctly, and writes a structured JSON file.
+A small Python scraper that collects the **entire Willab Garden catalogue** from
+the retailer's public Google Merchant product feed, groups product variants
+correctly, and writes a structured JSON file.
 
 ```bash
 python scraper.py --limit 10     # fast smoke test (seconds)
 python scraper.py                # full catalogue
+python scraper.py --enrich       # full catalogue + per-page enrichment (richer)
 ```
 
 On the live feed this produces **792 products from 13,649 variants**.
+
+The optional [`--enrich`](#optional-enrichment---enrich) step visits each product
+page to recover attributes the feed omits (colour, material, dimensions, the full
+specification table, and a rich description) — raising colour coverage from ~0%
+to ~70% and adding a complete spec table to every product. The feed remains the
+reliable backbone; enrichment only fills gaps and adds detail.
 
 ---
 
@@ -104,7 +111,57 @@ Wrote willabgarden_products.json
 | `--output PATH` | `willabgarden_products.json` | Output JSON path. |
 | `--limit N` | *(all)* | Process only the first N **products** (post-grouping). Great for a fast smoke test. |
 | `--raw-cache PATH` | *(off)* | Save the fetched feed to this path; if it already exists, parse it instead of re-fetching. Faster iteration, polite to the server. |
+| `--enrich` | *(off)* | Visit each product page to add colour, material, dimensions, the full spec table, and a rich description. See [below](#optional-enrichment---enrich). |
+| `--enrich-delay SECONDS` | `0.3` | Delay between enrichment page requests, to stay polite. |
 | `--pretty` / `--no-pretty` | pretty | Pretty-print (default) or emit compact JSON. |
+
+---
+
+## Optional enrichment (`--enrich`)
+
+The feed is complete and reliable but omits structured attributes such as
+**colour, material, dimensions, and the full specification table**. That data is
+not in the server-rendered HTML (the page is client-side rendered and ships an
+empty `<main>`), but it *is* embedded in a JSON hydration blob under
+`pageContent.product` in each page. [`enrich.py`](enrich.py) extracts that blob
+**without a headless browser** — a plain `requests` GET plus JSON parsing — and
+merges the result onto the feed's products.
+
+```bash
+python scraper.py --enrich                    # full catalogue, enriched
+python scraper.py --limit 20 --enrich         # quick enriched sample
+```
+
+What it adds:
+
+- Fills `color` / `material` / `size` on variants where the feed left them
+  `null` (from the product's "Produktspecifikation" table).
+- Adds a product-level **`specifications`** object — the full spec table as
+  key/value pairs (e.g. `Material väggar`, `Stormgaranti`, `Typ av glas`).
+- Adds a product-level **`full_description`** — the page's rich description text.
+
+Measured on a 51-product sample spanning all six categories (1,275 variants):
+
+| Attribute | Feed only | With `--enrich` |
+| --- | --- | --- |
+| `color` | ~0% | **70%** |
+| `size` | 20% | **55%** |
+| `material` | 4% | **52%** |
+| `specifications` | — | **100%** of products |
+| `full_description` | — | **100%** of products |
+
+Design notes:
+
+- **Feed data wins.** Enrichment only fills `null`s and adds new fields; it never
+  overwrites a value already present from the feed.
+- **Product-level, not per-variant** — one request per product (~792 total, a few
+  minutes with the default polite delay), because the spec table is
+  product-level. It is opt-in so the core scraper stays fast and dependency-light.
+- **Best-effort and safe** — the `pageContent.product` shape is an internal CMS
+  structure that could change. A page that can't be fetched or parsed simply
+  leaves the feed data untouched; enrichment never aborts the run.
+- **Output shape is stable** — the `specifications` / `full_description` keys only
+  appear when enrichment runs, so plain (un-enriched) output is unchanged.
 
 ---
 
@@ -114,6 +171,10 @@ The scraper writes a single JSON document. Swedish characters (å ä ö) are
 preserved (`ensure_ascii=False`), prices are structured into an amount and
 currency, and every product carries a uniform `variants` array — even
 standalone products (a single-element array), so consumers never special-case.
+
+The example below is from an **enriched** run; the `specifications` and
+`full_description` keys (and most `color`/`material`/`size` values) come from
+enrichment and are absent in a plain run.
 
 ```json
 {
@@ -130,6 +191,13 @@ standalone products (a single-element array), so consumers never special-case.
       "product_type": "Växthus > Växthusmodeller > Stormsäkra växthus",
       "google_product_category": null,
       "variant_count": 73,
+      "specifications": {
+        "Yta": "24,4 m²",
+        "Färg": "RAL 3005 - Vinröd",
+        "Material väggar": "4 mm säkerhetsglas",
+        "Stormgaranti": "5 år"
+      },
+      "full_description": "Green Room är Willab Gardens serie för stormsäkra växthus…",
       "variants": [
         {
           "id": "3024SR",
@@ -139,9 +207,9 @@ standalone products (a single-element array), so consumers never special-case.
           "sale_price": null,
           "availability": "in stock",
           "condition": "new",
-          "color": null,
+          "color": "RAL 3005 - Vinröd",
           "size": "24.4 m²",
-          "material": null,
+          "material": "4 mm säkerhetsglas",
           "gtin": null,
           "mpn": null,
           "image_link": "https://…",
@@ -154,7 +222,8 @@ standalone products (a single-element array), so consumers never special-case.
 ```
 
 A committed [`sample_output.json`](sample_output.json) (generated with
-`--limit 10`) lets you see the exact shape without running anything.
+`--limit 10 --enrich`) lets you see the exact shape — including the enrichment
+fields — without running anything.
 
 ### How variants are grouped
 
@@ -175,8 +244,9 @@ fields — the only place that information appears is inside the free-text title
 (e.g. "… 24.4 m²") or, for colour, encoded in the SKU suffix in an
 inconsistent, undocumented way.
 
-The scraper therefore **derives these attributes conservatively from the
-title** when they are unambiguously present, and leaves them `null` otherwise:
+Without enrichment, the scraper **derives these attributes conservatively from
+the title** when they are unambiguously present, and leaves them `null`
+otherwise:
 
 - **`size`** — an area (`24.4 m²`) or an explicit dimension is extracted from
   the title (populated for ~20% of variants, mostly greenhouses).
@@ -187,8 +257,11 @@ title** when they are unambiguously present, and leaves them `null` otherwise:
   from ambiguous SKU letters was deliberately avoided: a wrong colour is worse
   than an honest `null`.
 
-If a future feed adds the structured `g:color`/`g:size`/`g:material` fields, the
-parser prefers those and falls back to derivation only when they are missing.
+The precedence for each field is: **structured feed field → page enrichment
+(if `--enrich`) → title derivation → `null`.** So a plain run relies on
+derivation, while `--enrich` fills most of these gaps with real values from the
+product's specification table — see
+[Optional enrichment](#optional-enrichment---enrich).
 
 ---
 
@@ -206,33 +279,41 @@ parser prefers those and falls back to derivation only when they are missing.
   with exponential backoff.
 - **Idempotent**: re-running produces the same output; `--raw-cache` avoids
   re-hitting the server during development.
+- **Enrichment is best-effort**: a page that can't be fetched or parsed leaves
+  the feed data untouched rather than aborting the run.
 
 ---
 
 ## Tests
 
-An optional schema test validates the output structure:
-
 ```bash
 pip install pytest
-python scraper.py --limit 10          # produce willabgarden_products.json
 pytest
 ```
 
-It checks that every product has a non-empty `variants` list and that every
-variant has an `id` and a parsed `price`. It also exercises the price parser and
-the title-derivation helpers directly.
+The suite runs fully offline. It covers:
+
+- **Feed parsing** ([tests/test_schema.py](tests/test_schema.py)) — grouping
+  invariants (uniform `variants` array; every variant has an `id` and a parsed
+  `price`), shared-attribute lifting, plus the price parser and title-derivation
+  helpers.
+- **Enrichment** ([tests/test_enrich.py](tests/test_enrich.py)) — blob
+  extraction, spec-table parsing (including the inconsistent `</br>` markup), and
+  the gap-filling merge semantics, all against real product-page fixtures saved
+  in `tests/fixtures/`.
 
 ---
 
 ## Possible extensions
 
-The feed reflects what the retailer exposes to Google Merchant and may omit some
-page-level detail (e.g. the "Bra att veta" care notes) or lag the live site. A
-future version could enrich selected products via the site's Hello Retail search
-API (`core.helloretail.com`, the `websiteUuid` is present in the page) or
-targeted page scraping — layered on top of this feed parser, which stays the
-core of the solution.
+- **Concurrency for enrichment.** Enrichment is currently sequential (polite by
+  default). A bounded thread pool would cut the full-catalogue enrich time
+  substantially while still rate-limiting.
+- **Page cache for enrichment.** Like `--raw-cache` for the feed, caching fetched
+  product pages would make repeated enriched runs instant and even more polite.
+- **Hello Retail API.** The site also loads Hello Retail (`helloretailcdn.com`,
+  `websiteUuid` present in the page). Its search API could provide an alternative
+  structured source or power availability/recommendation data.
 
 ---
 
